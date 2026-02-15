@@ -17,6 +17,22 @@ import shutil
 import signal
 import sys
 
+# Pyrogram 2.0.106 calls asyncio.get_event_loop() at import time,
+# which raises on Python 3.12+. Patch before importing pyrogram.
+_orig_get_event_loop = asyncio.get_event_loop
+
+
+def _safe_get_event_loop():
+    try:
+        return _orig_get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
+asyncio.get_event_loop = _safe_get_event_loop
+
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pynput import keyboard
@@ -62,6 +78,16 @@ class LiveClaw:
             no_updates=False,
         )
 
+        # Pyrogram bot client (for deleting messages + sending voice)
+        self.bot_client = Client(
+            name="liveclaw_bot",
+            api_id=config["api_id"],
+            api_hash=config["api_hash"],
+            bot_token=config["bot_token"],
+            in_memory=True,
+            no_updates=False,
+        )
+
         # TTS engine
         self.tts = TTSEngine.from_config(config)
 
@@ -89,7 +115,7 @@ class LiveClaw:
         self.recorder: VoiceRecorder | None = None
 
         # Keyboard listener
-        self._kb_listener: keyboard.GlobalHotkeys | None = None
+        self._kb_listener: keyboard.GlobalHotKeys | None = None
 
     async def start(self) -> None:
         """Start all modules."""
@@ -117,10 +143,15 @@ class LiveClaw:
             self.config, self.audio_library
         )
 
-        # Start Pyrogram
+        # Start Pyrogram userbot
         await self.client.start()
         me = await self.client.get_me()
         logger.info(f"Logged in as {me.first_name} (ID: {me.id})")
+
+        # Start Pyrogram bot client
+        await self.bot_client.start()
+        bot_me = await self.bot_client.get_me()
+        logger.info(f"Bot client: {bot_me.first_name} (ID: {bot_me.id})")
 
         # Init recorder
         rec_cfg = self.config.get("recording", {})
@@ -138,9 +169,10 @@ class LiveClaw:
         # Start interceptor
         self.interceptor = MessageInterceptor(
             client=self.client,
-            bot_token=self.config["bot_token"],
+            bot_client=self.bot_client,
             bot_user_id=self.config["bot_user_id"],
             target_chat_id=self.target_chat_id,
+            user_id=me.id,
             classifier=self.classifier,
             tts_engine=self.tts,
             audio_library=self.audio_library,
@@ -190,6 +222,11 @@ class LiveClaw:
         except ConnectionError:
             pass
 
+        try:
+            await self.bot_client.stop()
+        except ConnectionError:
+            pass
+
         logger.info("Shutdown complete.")
 
     def _start_keyboard_listener(self) -> None:
@@ -203,7 +240,7 @@ class LiveClaw:
             logger.info(f"Hotkey — {state} recording")
             self.recorder.toggle(self.loop)
 
-        listener = keyboard.GlobalHotkeys({shortcut: on_record})
+        listener = keyboard.GlobalHotKeys({shortcut: on_record})
         listener.start()
         self._kb_listener = listener
         logger.info(f"Hotkey registered: {shortcut}")

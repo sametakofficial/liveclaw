@@ -3,16 +3,19 @@
 Watches for OpenClaw bot text messages in the target chat, deletes them,
 classifies the content, and sends voice replacements.
 
-Flow per message:
-  1. DELETE via Bot API HTTP call (~50ms)
-  2. CLASSIFY via regex-first + LLM fallback
-  3. VOICE via audio library hit or TTS generation
-  4. SEND as Telegram voice message
+Uses TWO Pyrogram clients:
+  - Userbot (MTProto, user account): listens for messages
+  - Bot client (MTProto, bot token): deletes messages + sends voice
 
-Adaptive queue strategy:
-  Queue 0-2:  Normal (regex → LLM fallback → TTS/library)
-  Queue 3-5:  Fast (regex only, skip LLM → TTS/library)
-  Queue 6+:   Batch (concatenate texts → single TTS)
+This is necessary because private chat message IDs are per-account.
+The userbot sees different IDs than the bot. Each client must use its own IDs.
+
+Flow per message:
+  1. Userbot intercepts bot text → extracts text
+  2. Bot client deletes the original text (using bot's own message ID)
+  3. CLASSIFY via regex-first + LLM fallback
+  4. VOICE via audio library hit or TTS generation
+  5. Bot client sends voice message with caption
 """
 
 import asyncio
@@ -22,7 +25,6 @@ import time
 from collections import deque
 from typing import Optional
 
-import aiohttp
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -36,9 +38,6 @@ logger = logging.getLogger(__name__)
 _QUEUE_FAST_THRESHOLD = 3
 _QUEUE_BATCH_THRESHOLD = 6
 
-# Bot API base URL
-_BOT_API = "https://api.telegram.org/bot{token}/{method}"
-
 
 class MessageInterceptor:
     """Intercepts bot text messages and replaces them with voice."""
@@ -46,39 +45,59 @@ class MessageInterceptor:
     def __init__(
         self,
         client: Client,
-        bot_token: str,
+        bot_client: Client,
         bot_user_id: int,
         target_chat_id: int,
+        user_id: int,
         classifier: MessageClassifier,
         tts_engine: TTSEngine,
         audio_library: AudioLibrary,
     ):
-        self._client = client
-        self._bot_token = bot_token
+        self._client = client          # Userbot — listens
+        self._bot = bot_client          # Bot — deletes + sends voice
         self._bot_user_id = bot_user_id
         self._target_chat_id = target_chat_id
+        self._user_id = user_id
         self._classifier = classifier
         self._tts = tts_engine
         self._library = audio_library
 
         self._queue: asyncio.Queue[tuple[str, int, int]] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
-        self._http_session: Optional[aiohttp.ClientSession] = None
 
-        # Duplicate detection: track recent message IDs
+        # Duplicate detection
         self._seen_ids: deque[int] = deque(maxlen=100)
 
+        # Map userbot text hash → bot message ID for deletion
+        # Bot handler stores: (chat_id, msg_id) keyed by (timestamp, text_hash)
+        self._bot_msg_ids: dict[str, tuple[int, int]] = {}
+
     async def start(self) -> None:
-        """Register Pyrogram handler and start the processing worker."""
-        self._http_session = aiohttp.ClientSession()
+        """Register handlers on both clients and start the worker."""
         self._worker_task = asyncio.create_task(self._worker())
 
-        # Register handler: text messages from bot in target chat
-        self._client.on_message(
+        # Bot client handler: capture message IDs from bot's perspective
+        @self._bot.on_message(
+            filters.chat(self._user_id)
+            & filters.outgoing
+            & filters.text
+        )
+        async def on_bot_outgoing(client: Client, message: Message):
+            """Bot sees its own outgoing messages with correct IDs for deletion."""
+            if not message.text:
+                return
+            text_key = message.text.strip()[:100]
+            self._bot_msg_ids[text_key] = (message.chat.id, message.id)
+            logger.debug(f"Bot tracked msg {message.id}: '{text_key[:40]}'")
+
+        # Userbot handler: intercept bot text messages
+        @self._client.on_message(
             filters.chat(self._target_chat_id)
             & filters.user(self._bot_user_id)
             & filters.text
-        )(self._on_bot_message)
+        )
+        async def on_userbot_intercept(client: Client, message: Message):
+            await self._on_bot_message(client, message)
 
         logger.info(
             f"Interceptor started — watching bot {self._bot_user_id} "
@@ -86,27 +105,20 @@ class MessageInterceptor:
         )
 
     async def stop(self) -> None:
-        """Stop the worker and clean up resources."""
+        """Stop the worker and clean up."""
         if self._worker_task:
             self._worker_task.cancel()
             try:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
-
-        if self._http_session:
-            await self._http_session.close()
-            self._http_session = None
-
         logger.info("Interceptor stopped")
 
     async def _on_bot_message(self, client: Client, message: Message) -> None:
-        """Pyrogram handler for incoming bot text messages."""
-        # Skip non-text (voice, media, etc.)
+        """Userbot handler for incoming bot text messages."""
         if not message.text:
             return
 
-        # Duplicate check
         if message.id in self._seen_ids:
             return
         self._seen_ids.append(message.id)
@@ -115,15 +127,51 @@ class MessageInterceptor:
         if not text:
             return
 
-        # Delete first, then queue for processing
-        asyncio.create_task(self._delete_message(message.chat.id, message.id))
+        # Try to delete via bot client (correct message IDs)
+        asyncio.create_task(self._delete_message(text))
 
-        # Enqueue: (text, chat_id, timestamp)
-        await self._queue.put((text, message.chat.id, int(time.time())))
-        logger.debug(f"Queued message: '{text[:60]}' (queue size: {self._queue.qsize()})")
+        # Enqueue for voice processing
+        await self._queue.put((text, self._user_id, int(time.time())))
+        logger.info(f"Queued: '{text[:60]}' (queue: {self._queue.qsize()})")
+
+    async def _delete_message(self, text: str) -> None:
+        """Delete bot's text message using the bot client.
+
+        Looks up the bot-side message ID by matching text content.
+        Waits briefly for the bot handler to capture the ID.
+        """
+        text_key = text.strip()[:100]
+
+        # Wait up to 2 seconds for bot handler to capture the message ID
+        for _ in range(20):
+            if text_key in self._bot_msg_ids:
+                chat_id, msg_id = self._bot_msg_ids.pop(text_key)
+                try:
+                    await self._bot.delete_messages(chat_id, msg_id)
+                    logger.info(f"Deleted message {msg_id} (via bot)")
+                    return
+                except Exception as e:
+                    logger.warning(f"Bot delete failed for msg {msg_id}: {e}")
+                    return
+            await asyncio.sleep(0.1)
+
+        # Fallback: try deleting via userbot
+        logger.warning(f"Bot msg ID not found for: '{text_key[:40]}', trying userbot")
+        try:
+            # Search recent messages from bot in chat
+            async for msg in self._client.get_chat_history(
+                self._target_chat_id, limit=5
+            ):
+                if (msg.from_user and msg.from_user.id == self._bot_user_id
+                        and msg.text and msg.text.strip()[:100] == text_key):
+                    await self._client.delete_messages(self._target_chat_id, msg.id)
+                    logger.info(f"Deleted message {msg.id} (via userbot fallback)")
+                    return
+        except Exception as e:
+            logger.warning(f"Userbot delete fallback failed: {e}")
 
     async def _worker(self) -> None:
-        """Process queued messages sequentially with adaptive strategy."""
+        """Process queued messages with adaptive strategy."""
         while True:
             try:
                 text, chat_id, ts = await self._queue.get()
@@ -131,16 +179,13 @@ class MessageInterceptor:
 
                 try:
                     if qsize >= _QUEUE_BATCH_THRESHOLD:
-                        # Batch mode: drain queue, combine texts
                         await self._process_batch(text, chat_id)
                     elif qsize >= _QUEUE_FAST_THRESHOLD:
-                        # Fast mode: regex only, skip LLM
                         await self._process_fast(text, chat_id)
                     else:
-                        # Normal mode: full pipeline
                         await self._process_normal(text, chat_id)
                 except Exception as e:
-                    logger.error(f"Worker error processing message: {e}")
+                    logger.error(f"Worker error: {e}")
                 finally:
                     self._queue.task_done()
 
@@ -150,27 +195,20 @@ class MessageInterceptor:
                 logger.error(f"Worker loop error: {e}")
 
     async def _process_normal(self, text: str, chat_id: int) -> None:
-        """Full pipeline: regex → LLM → library/TTS."""
         result = await self._classifier.classify(text)
         await self._handle_result(result, text, chat_id)
 
     async def _process_fast(self, text: str, chat_id: int) -> None:
-        """Fast pipeline: regex only, skip LLM. Fallback to TTS."""
         import patterns as pat
-
         key = pat.match(text)
         if key is not None:
             result = {"action": RESULT_LIBRARY, "key": key}
         else:
             result = {"action": RESULT_TTS, "text": MessageClassifier._clean_for_speech(text)}
-
         await self._handle_result(result, text, chat_id)
 
     async def _process_batch(self, first_text: str, chat_id: int) -> None:
-        """Batch mode: drain queue, combine all texts into single TTS."""
         texts = [first_text]
-
-        # Drain remaining items from queue
         while not self._queue.empty():
             try:
                 text, _, _ = self._queue.get_nowait()
@@ -181,13 +219,11 @@ class MessageInterceptor:
 
         combined = " ".join(texts)
         cleaned = MessageClassifier._clean_for_speech(combined)
-        logger.info(f"Batch mode: combined {len(texts)} messages ({len(cleaned)} chars)")
-
+        logger.info(f"Batch: {len(texts)} messages ({len(cleaned)} chars)")
         result = {"action": RESULT_TTS, "text": cleaned}
         await self._handle_result(result, combined, chat_id)
 
     async def _handle_result(self, result: dict, original_text: str, chat_id: int) -> None:
-        """Route classification result to library or TTS, then send voice."""
         audio_path: Optional[str] = None
         is_temp = False
 
@@ -198,8 +234,6 @@ class MessageInterceptor:
                 if audio_path:
                     logger.info(f"Library hit: {key}")
                 else:
-                    # Library file missing — fall back to TTS
-                    logger.debug(f"Library miss for '{key}', falling back to TTS")
                     cleaned = MessageClassifier._clean_for_speech(original_text)
                     audio_path = await self._tts.generate(cleaned)
                     is_temp = True
@@ -211,48 +245,35 @@ class MessageInterceptor:
                     is_temp = True
 
             if audio_path:
-                await self._send_voice(chat_id, audio_path)
+                await self._send_voice(chat_id, audio_path, caption=original_text)
             else:
-                logger.warning(f"No audio produced for: '{original_text[:60]}'")
+                logger.warning(f"No audio for: '{original_text[:60]}'")
 
         finally:
-            # Clean up temp TTS files (not library files)
             if is_temp and audio_path:
                 try:
                     os.unlink(audio_path)
                 except OSError:
                     pass
 
-    async def _delete_message(self, chat_id: int, message_id: int) -> None:
-        """Delete a message via Bot API HTTP call.
-
-        Uses the bot token (not userbot) so the bot deletes its own message.
-        This removes it for everyone on all devices.
-        """
-        if not self._http_session:
-            return
-
-        url = _BOT_API.format(token=self._bot_token, method="deleteMessage")
-        payload = {"chat_id": chat_id, "message_id": message_id}
-
+    async def _send_voice(self, chat_id: int, audio_path: str, caption: str = "") -> None:
+        """Send voice message via bot client."""
         try:
-            async with self._http_session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if not data.get("ok"):
-                        logger.debug(f"Delete failed: {data.get('description', 'unknown')}")
-                else:
-                    logger.debug(f"Delete HTTP {resp.status} for message {message_id}")
-        except Exception as e:
-            logger.debug(f"Delete error for message {message_id}: {e}")
-
-    async def _send_voice(self, chat_id: int, audio_path: str) -> None:
-        """Send an audio file as a Telegram voice message via Pyrogram."""
-        try:
-            await self._client.send_voice(
+            await self._bot.send_voice(
                 chat_id=chat_id,
                 voice=audio_path,
+                caption=caption[:1024] if caption else None,
             )
-            logger.info(f"Voice sent to {chat_id}")
+            logger.info(f"Voice sent to {chat_id} (via bot)")
         except Exception as e:
-            logger.error(f"Failed to send voice: {e}")
+            logger.error(f"Bot send_voice failed: {e}")
+            # Fallback to userbot
+            try:
+                await self._client.send_voice(
+                    chat_id=chat_id,
+                    voice=audio_path,
+                    caption=caption[:1024] if caption else None,
+                )
+                logger.info(f"Voice sent to {chat_id} (via userbot fallback)")
+            except Exception as e2:
+                logger.error(f"Userbot fallback also failed: {e2}")
