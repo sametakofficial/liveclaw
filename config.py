@@ -19,11 +19,16 @@ _REQUIRED = {
 
 # Optional keys with defaults
 _DEFAULTS: dict[str, Any] = {
-    "tts_provider": "edge",
-    "tts_model": "",
-    "tts_voice": "tr-TR-AhmetNeural",
+    "tts_provider": "proxy",
+    "tts_model": "tts-1",
+    "tts_voice": "Decent_Boy",
     "tts_api_key": "",
-    "tts_api_base": "",
+    "tts_api_base": "http://127.0.0.1:5111",
+    "stt_provider": "proxy",
+    "stt_model": "whisper-large-v3-turbo",
+    "stt_api_key": "",
+    "stt_api_base": "http://127.0.0.1:5111",
+    "stt_language": "tr",
     "classifier_model": "anthropic/claude-3-5-haiku-20241022",
     "classifier_api_key": "",
     "classifier_timeout": 3.0,

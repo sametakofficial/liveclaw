@@ -51,8 +51,11 @@ class TestApplyDefaults:
         config = _make_valid_config()
         apply_defaults(config)
 
-        assert config["tts_provider"] == "edge"
-        assert config["tts_voice"] == "tr-TR-AhmetNeural"
+        assert config["tts_provider"] == "proxy"
+        assert config["tts_voice"] == "Decent_Boy"
+        assert config["tts_api_base"] == "http://127.0.0.1:5111"
+        assert config["stt_provider"] == "proxy"
+        assert config["stt_model"] == "whisper-large-v3-turbo"
         assert config["log_file"] == "liveclaw.log"
         assert config["classifier_model"] == "anthropic/claude-3-5-haiku-20241022"
 
@@ -76,15 +79,16 @@ class TestApplyDefaults:
 class TestTTSEngineFromConfig:
     """Test TTSEngine.from_config integration with config defaults."""
 
-    def test_edge_default(self):
+    def test_proxy_default(self):
         from tts_engine import TTSEngine
 
         config = _make_valid_config()
         apply_defaults(config)
         engine = TTSEngine.from_config(config)
 
-        assert engine.provider == "edge"
-        assert engine.voice == "tr-TR-AhmetNeural"
+        assert engine.provider == "proxy"
+        assert engine.voice == "Decent_Boy"
+        assert engine.api_base == "http://127.0.0.1:5111"
 
     def test_openai_config(self):
         from tts_engine import TTSEngine

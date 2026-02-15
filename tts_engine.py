@@ -1,6 +1,7 @@
 """TTS engine abstraction layer.
 
 Routes text-to-speech requests to the configured provider:
+- proxy: Local tts-proxy server (OpenAI-compatible, supports sherpa/gateai/minimax)
 - LiteLLM providers: OpenAI, ElevenLabs, MiniMax, Google Vertex, Azure
 - Edge TTS: free, no API key, good Turkish support (custom wrapper)
 
@@ -11,17 +12,15 @@ import asyncio
 import logging
 import os
 import tempfile
-from pathlib import Path
 from typing import Optional
+
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Providers that go through LiteLLM
-_LITELLM_PROVIDERS = {"openai", "elevenlabs", "minimax", "vertex_ai", "azure"}
-
 
 class TTSEngine:
-    """Unified TTS interface supporting multiple providers via LiteLLM + Edge TTS."""
+    """Unified TTS interface supporting proxy, LiteLLM providers, and Edge TTS."""
 
     def __init__(
         self,
@@ -60,14 +59,14 @@ class TTSEngine:
             return None
 
         try:
-            if self.provider == "edge":
-                return await asyncio.wait_for(
-                    self._generate_edge(text), timeout=self.timeout
-                )
+            if self.provider == "proxy":
+                coro = self._generate_proxy(text)
+            elif self.provider == "edge":
+                coro = self._generate_edge(text)
             else:
-                return await asyncio.wait_for(
-                    self._generate_litellm(text), timeout=self.timeout
-                )
+                coro = self._generate_litellm(text)
+
+            return await asyncio.wait_for(coro, timeout=self.timeout)
         except asyncio.TimeoutError:
             logger.error(f"TTS generation timed out after {self.timeout}s")
             return None
@@ -75,14 +74,59 @@ class TTSEngine:
             logger.error(f"TTS generation failed: {e}")
             return None
 
+    async def _generate_proxy(self, text: str) -> Optional[str]:
+        """Generate via local tts-proxy (OpenAI-compatible endpoint)."""
+        base = self.api_base or "http://127.0.0.1:5111"
+        url = f"{base}/v1/audio/speech"
+
+        payload = {
+            "model": self.model or "tts-1",
+            "input": text,
+            "voice": self.voice or "Decent_Boy",
+            "response_format": "mp3",
+        }
+
+        fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=self.timeout)
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error(f"Proxy TTS HTTP {resp.status}: {body[:200]}")
+                        os.close(fd)
+                        os.unlink(mp3_path)
+                        return None
+
+                    with os.fdopen(fd, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            f.write(chunk)
+                    fd = -1  # closed via fdopen
+        except Exception as e:
+            logger.error(f"Proxy TTS request failed: {e}")
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(mp3_path)
+            except OSError:
+                pass
+            return None
+
+        # Convert MP3 → OGG Opus
+        ogg_path = await self._convert_to_ogg(mp3_path)
+        try:
+            os.unlink(mp3_path)
+        except OSError:
+            pass
+        return ogg_path
+
     async def _generate_litellm(self, text: str) -> Optional[str]:
         """Generate via LiteLLM (OpenAI, ElevenLabs, MiniMax, Vertex, Azure)."""
         import litellm
 
-        # Determine model string
         model = self.model
         if not model:
-            # Default models per provider prefix
             defaults = {
                 "openai": "openai/tts-1",
                 "elevenlabs": "elevenlabs/eleven_multilingual_v2",
@@ -91,7 +135,6 @@ class TTSEngine:
             }
             model = defaults.get(self.provider, f"{self.provider}/tts-1")
 
-        # Build kwargs
         kwargs: dict = {"model": model, "input": text}
         if self.voice:
             kwargs["voice"] = self.voice
@@ -100,16 +143,12 @@ class TTSEngine:
         if self.api_base:
             kwargs["api_base"] = self.api_base
 
-        # LiteLLM async speech call
         response = await litellm.aspeech(**kwargs)
 
-        # Write response to temp MP3 file
         fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
         try:
-            # response is an HttpxBinaryResponseContent — stream to file
             response.stream_to_file(mp3_path)
         except AttributeError:
-            # Fallback: response might be bytes directly
             with os.fdopen(fd, "wb") as f:
                 if hasattr(response, "content"):
                     f.write(response.content)
@@ -117,30 +156,22 @@ class TTSEngine:
                     f.write(response)
                 else:
                     f.write(response.read())
-            fd = -1  # Already closed via fdopen
+            fd = -1
         finally:
             if fd >= 0:
                 os.close(fd)
 
-        # Convert MP3 → OGG Opus
         ogg_path = await self._convert_to_ogg(mp3_path)
-
-        # Clean up MP3
         try:
             os.unlink(mp3_path)
         except OSError:
             pass
-
         return ogg_path
 
     async def _generate_edge(self, text: str) -> Optional[str]:
         """Generate via edge-tts package (free, no API key)."""
         import edge_tts
 
-        fd, ogg_path = tempfile.mkstemp(suffix=".ogg")
-        os.close(fd)
-
-        # Edge TTS can output MP3 natively; we'll convert to OGG
         fd_mp3, mp3_path = tempfile.mkstemp(suffix=".mp3")
         os.close(fd_mp3)
 
@@ -148,38 +179,27 @@ class TTSEngine:
             communicate = edge_tts.Communicate(text, self.voice)
             await communicate.save(mp3_path)
 
-            # Convert to OGG Opus for Telegram
             result = await self._convert_to_ogg(mp3_path)
-
             if result is None:
-                # ffmpeg failed — try sending MP3 path as fallback
-                # (won't show as voice bubble but at least audio arrives)
                 logger.warning("OGG conversion failed, falling back to MP3")
                 return mp3_path
 
-            # Clean up MP3
             try:
                 os.unlink(mp3_path)
             except OSError:
                 pass
-
             return result
 
         except Exception as e:
             logger.error(f"Edge TTS failed: {e}")
-            # Clean up temp files on error
-            for p in (mp3_path, ogg_path):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+            try:
+                os.unlink(mp3_path)
+            except OSError:
+                pass
             return None
 
     async def _convert_to_ogg(self, input_path: str) -> Optional[str]:
-        """Convert audio file to OGG Opus using ffmpeg.
-
-        Returns path to .ogg file, or None if conversion fails.
-        """
+        """Convert audio file to OGG Opus using ffmpeg."""
         fd, ogg_path = tempfile.mkstemp(suffix=".ogg")
         os.close(fd)
 
