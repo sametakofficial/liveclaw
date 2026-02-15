@@ -1,0 +1,38 @@
+{
+    "ack_started": {
+        "file": "ack_started.ogg",
+        "description": "Task started acknowledgment",
+        "tts_text": "Tamam, başlıyorum.",
+        "examples": ["Tamam, başlıyorum", "On it", "Let me work on that", "Bakalım"]
+    },
+    "ack_searching": {
+        "file": "ack_searching.ogg",
+        "description": "Searching or researching something",
+        "tts_text": "Araştırıyorum.",
+        "examples": ["Araştırıyorum", "Searching...", "Looking into it", "Bakıyorum"]
+    },
+    "ack_thinking": {
+        "file": "ack_thinking.ogg",
+        "description": "Thinking or processing",
+        "tts_text": "Düşünüyorum, bir saniye.",
+        "examples": ["Düşünüyorum", "Let me think...", "Hmm", "Bir saniye"]
+    },
+    "ack_done": {
+        "file": "ack_done.ogg",
+        "description": "Task completed successfully",
+        "tts_text": "Tamamlandı.",
+        "examples": ["Tamamlandı", "Done!", "Here you go", "İşte burada"]
+    },
+    "ack_error": {
+        "file": "ack_error.ogg",
+        "description": "An error occurred",
+        "tts_text": "Bir hata oluştu.",
+        "examples": ["Hata aldım", "Error occurred", "Something went wrong", "Başarısız oldu"]
+    },
+    "ack_progress": {
+        "file": "ack_progress.ogg",
+        "description": "Progress update on a multi-step task",
+        "tts_text": "Devam ediyorum.",
+        "examples": ["2. adım tamamlandı", "Step 3 of 5", "Halfway done", "İlerliyorum"]
+    }
+}

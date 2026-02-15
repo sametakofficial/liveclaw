@@ -1,0 +1,35 @@
+{
+    "api_id": 12345678,
+    "api_hash": "your_api_hash_here",
+    "session_string": "your_session_string_here",
+    "target_chat_id": -1001234567890,
+
+    "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+    "bot_user_id": 123456789,
+
+    "tts_provider": "edge",
+    "tts_model": "",
+    "tts_voice": "tr-TR-AhmetNeural",
+    "tts_api_key": "",
+    "tts_api_base": "",
+
+    "classifier_model": "anthropic/claude-3-5-haiku-20241022",
+    "classifier_api_key": "",
+    "classifier_timeout": 3.0,
+
+    "audio_library_dir": "audio_library",
+
+    "shortcuts": {
+        "record": "<ctrl>+<shift>+r"
+    },
+    "recording": {
+        "sample_rate": 48000,
+        "channels": 1,
+        "max_duration_seconds": 120
+    },
+    "playback": {
+        "player": "mpv",
+        "volume": 100
+    },
+    "log_file": "liveclaw.log"
+}

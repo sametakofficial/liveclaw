@@ -1,0 +1,43 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Config with secrets
+config.json
+
+# Logs
+*.log
+
+# Audio library generated files
+audio_library/*.ogg
+
+# Temp files
+*.tmp
+*.ogg.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Linter cache
+.ruff_cache/
+.mypy_cache/
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pyrogram session
+*.session
