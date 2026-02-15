@@ -277,22 +277,36 @@ class LiveClaw:
         logger.info(f"Bot client will reconnect in {wait_secs//60}m {wait_secs%60}s")
         await asyncio.sleep(wait_secs)
         try:
-            self.bot_client = Client(
-                name="liveclaw_bot",
-                api_id=self.config["api_id"],
-                api_hash=self.config["api_hash"],
-                bot_token=self.config["bot_token"],
-                workdir=os.path.dirname(os.path.abspath(__file__)),
-                no_updates=False,
-            )
+            # Reuse the original Client object (session file already exists)
+            if self.bot_client is None:
+                self.bot_client = Client(
+                    name="liveclaw_bot",
+                    api_id=self.config["api_id"],
+                    api_hash=self.config["api_hash"],
+                    bot_token=self.config["bot_token"],
+                    workdir=os.path.dirname(os.path.abspath(__file__)),
+                    no_updates=False,
+                )
             await self.bot_client.start()
             bot_me = await self.bot_client.get_me()
             logger.info(f"Bot client reconnected: {bot_me.first_name} (ID: {bot_me.id})")
-            # Update interceptor's bot client
+            # Update interceptor's bot client and register handler
             if self.interceptor:
                 self.interceptor._bot = self.bot_client
+                # Register bot outgoing handler for message ID tracking
+                from pyrogram import filters
+                @self.bot_client.on_message(
+                    filters.chat(self.client.me.id)
+                    & filters.outgoing
+                    & filters.text
+                )
+                async def on_bot_outgoing(client, message):
+                    if message.text:
+                        text_key = message.text.strip()[:100]
+                        self.interceptor._bot_msg_ids[text_key] = (message.chat.id, message.id)
         except Exception as e:
             logger.error(f"Bot client reconnect failed: {e}")
+            self.bot_client = None
 
     def _start_keyboard_listener(self) -> None:
         """Start recording toggle listener using cross-platform HotkeyManager."""

@@ -87,7 +87,12 @@ class HotkeyManager:
             wayland = session == "wayland" or os.environ.get("WAYLAND_DISPLAY")
 
             if wayland:
-                # Try XDG Portal first (Wayland native)
+                # Try hyprctl runtime bind (Hyprland)
+                if self._try_hyprctl():
+                    self._method = "hyprctl"
+                    return self._method
+
+                # Try XDG Portal (other Wayland compositors)
                 if self._try_xdg_portal():
                     self._method = "xdg-portal"
                     return self._method
@@ -109,6 +114,51 @@ class HotkeyManager:
     def stop(self) -> None:
         """Stop all listeners."""
         self._running = False
+
+    # ─── hyprctl runtime bind (Hyprland) ─────────────────────────────────
+
+    def _try_hyprctl(self) -> bool:
+        """Add runtime keybind via hyprctl (Hyprland only, no config edit)."""
+        try:
+            # Check if hyprctl exists
+            result = subprocess.run(
+                ["hyprctl", "version"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode != 0:
+                return False
+
+            # Parse shortcut: "ctrl+shift+r" → "CTRL SHIFT, R"
+            parts = self._shortcut.lower().split("+")
+            key = parts[-1].strip().upper()
+            mods = []
+            for p in parts[:-1]:
+                p = p.strip()
+                if p in ("ctrl", "control"):
+                    mods.append("CTRL")
+                elif p in ("shift",):
+                    mods.append("SHIFT")
+                elif p in ("alt",):
+                    mods.append("ALT")
+                elif p in ("super", "meta", "win", "cmd", "logo"):
+                    mods.append("SUPER")
+
+            mod_str = " ".join(mods)
+            bind_str = f"{mod_str}, {key}, exec, touch /tmp/liveclaw-record-toggle"
+
+            result = subprocess.run(
+                ["hyprctl", "keyword", "bind", bind_str],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode == 0 and "ok" in result.stdout.lower():
+                logger.info(f"hyprctl bind added: {mod_str}+{key}")
+                return True
+            return False
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        except Exception as e:
+            logger.debug(f"hyprctl failed: {e}")
+            return False
 
     # ─── XDG Desktop Portal GlobalShortcuts ────────────────────────────────
 
