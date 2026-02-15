@@ -77,18 +77,19 @@ class MessageInterceptor:
         self._worker_task = asyncio.create_task(self._worker())
 
         # Bot client handler: capture message IDs from bot's perspective
-        @self._bot.on_message(
-            filters.chat(self._user_id)
-            & filters.outgoing
-            & filters.text
-        )
-        async def on_bot_outgoing(client: Client, message: Message):
-            """Bot sees its own outgoing messages with correct IDs for deletion."""
-            if not message.text:
-                return
-            text_key = message.text.strip()[:100]
-            self._bot_msg_ids[text_key] = (message.chat.id, message.id)
-            logger.debug(f"Bot tracked msg {message.id}: '{text_key[:40]}'")
+        if self._bot is not None:
+            @self._bot.on_message(
+                filters.chat(self._user_id)
+                & filters.outgoing
+                & filters.text
+            )
+            async def on_bot_outgoing(client: Client, message: Message):
+                """Bot sees its own outgoing messages with correct IDs for deletion."""
+                if not message.text:
+                    return
+                text_key = message.text.strip()[:100]
+                self._bot_msg_ids[text_key] = (message.chat.id, message.id)
+                logger.debug(f"Bot tracked msg {message.id}: '{text_key[:40]}'")
 
         # Userbot handler: intercept bot text messages
         @self._client.on_message(
@@ -135,11 +136,12 @@ class MessageInterceptor:
         logger.info(f"Queued: '{text[:60]}' (queue: {self._queue.qsize()})")
 
     async def _delete_message(self, text: str) -> None:
-        """Delete bot's text message using the bot client.
+        """Delete bot's text message using the bot client or userbot fallback."""
+        if self._bot is None:
+            # No bot client — skip deletion
+            logger.debug("No bot client, skipping delete")
+            return
 
-        Looks up the bot-side message ID by matching text content.
-        Waits briefly for the bot handler to capture the ID.
-        """
         text_key = text.strip()[:100]
 
         # Wait up to 2 seconds for bot handler to capture the message ID
@@ -257,23 +259,26 @@ class MessageInterceptor:
                     pass
 
     async def _send_voice(self, chat_id: int, audio_path: str, caption: str = "") -> None:
-        """Send voice message via bot client."""
-        try:
-            await self._bot.send_voice(
-                chat_id=chat_id,
-                voice=audio_path,
-                caption=caption[:1024] if caption else None,
-            )
-            logger.info(f"Voice sent to {chat_id} (via bot)")
-        except Exception as e:
-            logger.error(f"Bot send_voice failed: {e}")
-            # Fallback to userbot
+        """Send voice message via bot client, fallback to userbot."""
+        if self._bot is not None:
             try:
-                await self._client.send_voice(
+                await self._bot.send_voice(
                     chat_id=chat_id,
                     voice=audio_path,
                     caption=caption[:1024] if caption else None,
                 )
-                logger.info(f"Voice sent to {chat_id} (via userbot fallback)")
-            except Exception as e2:
-                logger.error(f"Userbot fallback also failed: {e2}")
+                logger.info(f"Voice sent to {chat_id} (via bot)")
+                return
+            except Exception as e:
+                logger.error(f"Bot send_voice failed: {e}")
+
+        # Fallback to userbot
+        try:
+            await self._client.send_voice(
+                chat_id=self._target_chat_id,
+                voice=audio_path,
+                caption=caption[:1024] if caption else None,
+            )
+            logger.info(f"Voice sent to {chat_id} (via userbot)")
+        except Exception as e:
+            logger.error(f"Userbot send_voice also failed: {e}")

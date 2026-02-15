@@ -33,7 +33,7 @@ _DEFAULTS: dict[str, Any] = {
     "classifier_api_key": "",
     "classifier_timeout": 3.0,
     "audio_library_dir": "audio_library",
-    "shortcuts": {"record": "<ctrl>+<shift>+r"},
+    "shortcuts": {"record": "super+r"},
     "recording": {"sample_rate": 48000, "channels": 1, "max_duration_seconds": 120},
     "playback": {"player": "mpv", "volume": 100},
     "log_file": "liveclaw.log",

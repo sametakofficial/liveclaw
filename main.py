@@ -12,6 +12,7 @@ Usage:
 import argparse
 import asyncio
 import logging
+import os
 import platform
 import shutil
 import signal
@@ -35,7 +36,6 @@ asyncio.get_event_loop = _safe_get_event_loop
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pynput import keyboard
 
 from audio_library import AudioLibrary
 from classifier import MessageClassifier
@@ -84,7 +84,7 @@ class LiveClaw:
             api_id=config["api_id"],
             api_hash=config["api_hash"],
             bot_token=config["bot_token"],
-            in_memory=True,
+            workdir=os.path.dirname(os.path.abspath(__file__)),
             no_updates=False,
         )
 
@@ -115,7 +115,7 @@ class LiveClaw:
         self.recorder: VoiceRecorder | None = None
 
         # Keyboard listener
-        self._kb_listener: keyboard.GlobalHotKeys | None = None
+        self._hotkey_thread = None
 
     async def start(self) -> None:
         """Start all modules."""
@@ -148,10 +148,51 @@ class LiveClaw:
         me = await self.client.get_me()
         logger.info(f"Logged in as {me.first_name} (ID: {me.id})")
 
+        # Pre-cache bot peer so Pyrogram can resolve it later
+        try:
+            # Try by ID first, then by username from bot token
+            try:
+                bot_peer = await self.client.get_users(self.config["bot_user_id"])
+            except Exception:
+                # Resolve via sending /start to bot (creates the peer)
+                bot_username = None
+                try:
+                    import aiohttp
+                    token = self.config["bot_token"]
+                    async with aiohttp.ClientSession() as s:
+                        async with s.get(f"https://api.telegram.org/bot{token}/getMe") as r:
+                            data = await r.json()
+                            bot_username = data["result"].get("username")
+                except Exception:
+                    pass
+
+                if bot_username:
+                    bot_peer = await self.client.get_chat(f"@{bot_username}")
+                    logger.info(f"Bot peer cached via username: @{bot_username}")
+                else:
+                    raise Exception("Could not resolve bot peer")
+            else:
+                logger.info(f"Bot peer cached: {bot_peer.first_name}")
+        except Exception as e:
+            logger.warning(f"Could not cache bot peer: {e}")
+
         # Start Pyrogram bot client
-        await self.bot_client.start()
-        bot_me = await self.bot_client.get_me()
-        logger.info(f"Bot client: {bot_me.first_name} (ID: {bot_me.id})")
+        try:
+            await self.bot_client.start()
+            bot_me = await self.bot_client.get_me()
+            logger.info(f"Bot client: {bot_me.first_name} (ID: {bot_me.id})")
+        except Exception as e:
+            if "FLOOD_WAIT" in str(e):
+                import re
+                wait_match = re.search(r"(\d+) seconds", str(e))
+                wait_secs = int(wait_match.group(1)) if wait_match else 60
+                logger.warning(f"Bot FloodWait: {wait_secs}s — running without bot client for now")
+                self.bot_client = None
+                # Schedule reconnect in background
+                asyncio.create_task(self._delayed_bot_connect(wait_secs + 10))
+            else:
+                logger.error(f"Bot client failed: {e}")
+                self.bot_client = None
 
         # Init recorder
         rec_cfg = self.config.get("recording", {})
@@ -206,8 +247,10 @@ class LiveClaw:
         """Gracefully shut down all modules."""
         logger.info("Shutting down...")
 
-        if self._kb_listener is not None:
-            self._kb_listener.stop()
+        if self._hotkey_running:
+            self._hotkey_running = False
+            if hasattr(self, '_hotkey_mgr'):
+                self._hotkey_mgr.stop()
 
         if self.interceptor is not None:
             await self.interceptor.stop()
@@ -224,26 +267,55 @@ class LiveClaw:
 
         try:
             await self.bot_client.stop()
-        except ConnectionError:
+        except (ConnectionError, AttributeError):
             pass
 
         logger.info("Shutdown complete.")
 
+    async def _delayed_bot_connect(self, wait_secs: int) -> None:
+        """Reconnect bot client after FloodWait expires."""
+        logger.info(f"Bot client will reconnect in {wait_secs//60}m {wait_secs%60}s")
+        await asyncio.sleep(wait_secs)
+        try:
+            self.bot_client = Client(
+                name="liveclaw_bot",
+                api_id=self.config["api_id"],
+                api_hash=self.config["api_hash"],
+                bot_token=self.config["bot_token"],
+                workdir=os.path.dirname(os.path.abspath(__file__)),
+                no_updates=False,
+            )
+            await self.bot_client.start()
+            bot_me = await self.bot_client.get_me()
+            logger.info(f"Bot client reconnected: {bot_me.first_name} (ID: {bot_me.id})")
+            # Update interceptor's bot client
+            if self.interceptor:
+                self.interceptor._bot = self.bot_client
+        except Exception as e:
+            logger.error(f"Bot client reconnect failed: {e}")
+
     def _start_keyboard_listener(self) -> None:
-        """Register global hotkey for mic recording toggle."""
-        shortcut = self.config.get("shortcuts", {}).get("record", "<ctrl>+<shift>+r")
+        """Start recording toggle listener using cross-platform HotkeyManager."""
+        from hotkey import HotkeyManager, notify
+
+        shortcut = self.config.get("shortcuts", {}).get("record", "ctrl+shift+r")
 
         def on_record():
             if self.recorder is None or self.loop is None:
                 return
-            state = "stop" if self.recorder.is_recording else "start"
-            logger.info(f"Hotkey — {state} recording")
-            self.recorder.toggle(self.loop)
+            if self.recorder.is_recording:
+                logger.info("Hotkey — stop recording")
+                notify("Kayit Durduruldu", "Ses mesaji gonderiliyor...")
+                self.recorder.toggle(self.loop)
+            else:
+                logger.info("Hotkey — start recording")
+                notify("Kayit Basladi", "Konusmaya basla...")
+                self.recorder.toggle(self.loop)
 
-        listener = keyboard.GlobalHotKeys({shortcut: on_record})
-        listener.start()
-        self._kb_listener = listener
-        logger.info(f"Hotkey registered: {shortcut}")
+        self._hotkey_running = True
+        self._hotkey_mgr = HotkeyManager(callback=on_record, shortcut=shortcut)
+        method = self._hotkey_mgr.start()
+        logger.info(f"Hotkey active via: {method} (shortcut: {shortcut})")
 
 
 async def run() -> None:
