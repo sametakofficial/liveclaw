@@ -11,13 +11,11 @@ Usage:
 
 import argparse
 import asyncio
-import json
 import logging
 import platform
 import shutil
 import signal
 import sys
-from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -25,54 +23,13 @@ from pynput import keyboard
 
 from audio_library import AudioLibrary
 from classifier import MessageClassifier
+from config import load_config
 from interceptor import MessageInterceptor
 from player import VoicePlayer
 from recorder import VoiceRecorder
 from tts_engine import TTSEngine
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
-
 logger = logging.getLogger("liveclaw")
-
-# Required config keys and their expected types
-_REQUIRED_KEYS = {
-    "api_id": int,
-    "api_hash": str,
-    "session_string": str,
-    "target_chat_id": int,
-    "bot_token": str,
-    "bot_user_id": int,
-}
-
-
-def load_config() -> dict:
-    """Load and validate config.json."""
-    if not CONFIG_PATH.exists():
-        print(f"Config not found: {CONFIG_PATH}")
-        print("Copy config.json.example to config.json and fill in your values.")
-        sys.exit(1)
-
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        try:
-            config = json.load(f)
-        except json.JSONDecodeError as e:
-            print(f"Invalid JSON in config.json: {e}")
-            sys.exit(1)
-
-    # Validate required keys and types
-    for key, expected_type in _REQUIRED_KEYS.items():
-        value = config.get(key)
-        if value is None or (isinstance(value, str) and not value.strip()):
-            print(f"Error: '{key}' is required in config.json")
-            sys.exit(1)
-        if not isinstance(value, expected_type):
-            try:
-                config[key] = expected_type(value)
-            except (ValueError, TypeError):
-                print(f"Error: '{key}' must be {expected_type.__name__}, got: {value!r}")
-                sys.exit(1)
-
-    return config
 
 
 def setup_logging(log_file: str) -> None:

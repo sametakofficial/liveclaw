@@ -154,10 +154,10 @@ class MessageClassifier:
         text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
         # Remove markdown bold/italic
         text = re.sub(r"[*_]{1,3}([^*_]+)[*_]{1,3}", r"\1", text)
-        # Remove URLs
-        text = re.sub(r"https?://\S+", "", text)
-        # Remove markdown links [text](url)
+        # Remove markdown links [text](url) — must run before bare URL removal
         text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+        # Remove bare URLs
+        text = re.sub(r"https?://\S+", "", text)
         # Collapse whitespace
         text = re.sub(r"\s+", " ", text).strip()
 
