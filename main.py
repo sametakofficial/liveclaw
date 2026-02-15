@@ -78,16 +78,6 @@ class LiveClaw:
             no_updates=False,
         )
 
-        # Pyrogram bot client (for deleting messages + sending voice)
-        self.bot_client = Client(
-            name="liveclaw_bot",
-            api_id=config["api_id"],
-            api_hash=config["api_hash"],
-            bot_token=config["bot_token"],
-            workdir=os.path.dirname(os.path.abspath(__file__)),
-            no_updates=False,
-        )
-
         # TTS engine
         self.tts = TTSEngine.from_config(config)
 
@@ -176,24 +166,6 @@ class LiveClaw:
         except Exception as e:
             logger.warning(f"Could not cache bot peer: {e}")
 
-        # Start Pyrogram bot client
-        try:
-            await self.bot_client.start()
-            bot_me = await self.bot_client.get_me()
-            logger.info(f"Bot client: {bot_me.first_name} (ID: {bot_me.id})")
-        except Exception as e:
-            if "FLOOD_WAIT" in str(e):
-                import re
-                wait_match = re.search(r"(\d+) seconds", str(e))
-                wait_secs = int(wait_match.group(1)) if wait_match else 60
-                logger.warning(f"Bot FloodWait: {wait_secs}s — running without bot client for now")
-                self.bot_client = None
-                # Schedule reconnect in background
-                asyncio.create_task(self._delayed_bot_connect(wait_secs + 10))
-            else:
-                logger.error(f"Bot client failed: {e}")
-                self.bot_client = None
-
         # Init recorder
         rec_cfg = self.config.get("recording", {})
         self.recorder = VoiceRecorder(
@@ -210,7 +182,7 @@ class LiveClaw:
         # Start interceptor
         self.interceptor = MessageInterceptor(
             client=self.client,
-            bot_client=self.bot_client,
+            bot_token=self.config["bot_token"],
             bot_user_id=self.config["bot_user_id"],
             target_chat_id=self.target_chat_id,
             user_id=me.id,
@@ -265,48 +237,7 @@ class LiveClaw:
         except ConnectionError:
             pass
 
-        try:
-            await self.bot_client.stop()
-        except (ConnectionError, AttributeError):
-            pass
-
         logger.info("Shutdown complete.")
-
-    async def _delayed_bot_connect(self, wait_secs: int) -> None:
-        """Reconnect bot client after FloodWait expires."""
-        logger.info(f"Bot client will reconnect in {wait_secs//60}m {wait_secs%60}s")
-        await asyncio.sleep(wait_secs)
-        try:
-            # Reuse the original Client object (session file already exists)
-            if self.bot_client is None:
-                self.bot_client = Client(
-                    name="liveclaw_bot",
-                    api_id=self.config["api_id"],
-                    api_hash=self.config["api_hash"],
-                    bot_token=self.config["bot_token"],
-                    workdir=os.path.dirname(os.path.abspath(__file__)),
-                    no_updates=False,
-                )
-            await self.bot_client.start()
-            bot_me = await self.bot_client.get_me()
-            logger.info(f"Bot client reconnected: {bot_me.first_name} (ID: {bot_me.id})")
-            # Update interceptor's bot client and register handler
-            if self.interceptor:
-                self.interceptor._bot = self.bot_client
-                # Register bot outgoing handler for message ID tracking
-                from pyrogram import filters
-                @self.bot_client.on_message(
-                    filters.chat(self.client.me.id)
-                    & filters.outgoing
-                    & filters.text
-                )
-                async def on_bot_outgoing(client, message):
-                    if message.text:
-                        text_key = message.text.strip()[:100]
-                        self.interceptor._bot_msg_ids[text_key] = (message.chat.id, message.id)
-        except Exception as e:
-            logger.error(f"Bot client reconnect failed: {e}")
-            self.bot_client = None
 
     def _start_keyboard_listener(self) -> None:
         """Start recording toggle listener using cross-platform HotkeyManager."""

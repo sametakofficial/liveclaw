@@ -3,19 +3,16 @@
 Watches for OpenClaw bot text messages in the target chat, deletes them,
 classifies the content, and sends voice replacements.
 
-Uses TWO Pyrogram clients:
-  - Userbot (MTProto, user account): listens for messages
-  - Bot client (MTProto, bot token): deletes messages + sends voice
-
-This is necessary because private chat message IDs are per-account.
-The userbot sees different IDs than the bot. Each client must use its own IDs.
+Architecture:
+  - Userbot (Pyrogram MTProto): listens for messages + deletes them
+  - Bot API (HTTP): sends voice messages (so they appear from the bot)
 
 Flow per message:
-  1. Userbot intercepts bot text → extracts text
-  2. Bot client deletes the original text (using bot's own message ID)
+  1. Userbot intercepts bot text message
+  2. Userbot deletes it (using its own message IDs)
   3. CLASSIFY via regex-first + LLM fallback
   4. VOICE via audio library hit or TTS generation
-  5. Bot client sends voice message with caption
+  5. Bot API sends voice message with caption
 """
 
 import asyncio
@@ -25,6 +22,7 @@ import time
 from collections import deque
 from typing import Optional
 
+import aiohttp
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -38,6 +36,9 @@ logger = logging.getLogger(__name__)
 _QUEUE_FAST_THRESHOLD = 3
 _QUEUE_BATCH_THRESHOLD = 6
 
+# Bot API base URL
+_BOT_API = "https://api.telegram.org/bot{token}/{method}"
+
 
 class MessageInterceptor:
     """Intercepts bot text messages and replaces them with voice."""
@@ -45,7 +46,7 @@ class MessageInterceptor:
     def __init__(
         self,
         client: Client,
-        bot_client: Client,
+        bot_token: str,
         bot_user_id: int,
         target_chat_id: int,
         user_id: int,
@@ -53,8 +54,8 @@ class MessageInterceptor:
         tts_engine: TTSEngine,
         audio_library: AudioLibrary,
     ):
-        self._client = client          # Userbot — listens
-        self._bot = bot_client          # Bot — deletes + sends voice
+        self._client = client          # Userbot — listens + deletes
+        self._bot_token = bot_token    # For Bot API HTTP calls (send voice)
         self._bot_user_id = bot_user_id
         self._target_chat_id = target_chat_id
         self._user_id = user_id
@@ -64,32 +65,15 @@ class MessageInterceptor:
 
         self._queue: asyncio.Queue[tuple[str, int, int]] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
+        self._http_session: Optional[aiohttp.ClientSession] = None
 
         # Duplicate detection
         self._seen_ids: deque[int] = deque(maxlen=100)
 
-        # Map userbot text hash → bot message ID for deletion
-        # Bot handler stores: (chat_id, msg_id) keyed by (timestamp, text_hash)
-        self._bot_msg_ids: dict[str, tuple[int, int]] = {}
-
     async def start(self) -> None:
-        """Register handlers on both clients and start the worker."""
+        """Register handler and start the worker."""
+        self._http_session = aiohttp.ClientSession()
         self._worker_task = asyncio.create_task(self._worker())
-
-        # Bot client handler: capture message IDs from bot's perspective
-        if self._bot is not None:
-            @self._bot.on_message(
-                filters.chat(self._user_id)
-                & filters.outgoing
-                & filters.text
-            )
-            async def on_bot_outgoing(client: Client, message: Message):
-                """Bot sees its own outgoing messages with correct IDs for deletion."""
-                if not message.text:
-                    return
-                text_key = message.text.strip()[:100]
-                self._bot_msg_ids[text_key] = (message.chat.id, message.id)
-                logger.debug(f"Bot tracked msg {message.id}: '{text_key[:40]}'")
 
         # Userbot handler: intercept bot text messages
         @self._client.on_message(
@@ -113,6 +97,11 @@ class MessageInterceptor:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
+
+        if self._http_session:
+            await self._http_session.close()
+            self._http_session = None
+
         logger.info("Interceptor stopped")
 
     async def _on_bot_message(self, client: Client, message: Message) -> None:
@@ -128,49 +117,24 @@ class MessageInterceptor:
         if not text:
             return
 
-        # Try to delete via bot client (correct message IDs)
-        asyncio.create_task(self._delete_message(text))
+        # Delete via userbot (uses userbot's own message IDs — always works)
+        asyncio.create_task(self._delete_message(message.chat.id, message.id))
 
-        # Enqueue for voice processing
+        # Enqueue for voice processing (use user_id for Bot API send)
         await self._queue.put((text, self._user_id, int(time.time())))
         logger.info(f"Queued: '{text[:60]}' (queue: {self._queue.qsize()})")
 
-    async def _delete_message(self, text: str) -> None:
-        """Delete bot's text message using the bot client or userbot fallback."""
-        if self._bot is None:
-            # No bot client — skip deletion
-            logger.debug("No bot client, skipping delete")
-            return
+    async def _delete_message(self, chat_id: int, message_id: int) -> None:
+        """Delete a message via userbot (Pyrogram).
 
-        text_key = text.strip()[:100]
-
-        # Wait up to 2 seconds for bot handler to capture the message ID
-        for _ in range(20):
-            if text_key in self._bot_msg_ids:
-                chat_id, msg_id = self._bot_msg_ids.pop(text_key)
-                try:
-                    await self._bot.delete_messages(chat_id, msg_id)
-                    logger.info(f"Deleted message {msg_id} (via bot)")
-                    return
-                except Exception as e:
-                    logger.warning(f"Bot delete failed for msg {msg_id}: {e}")
-                    return
-            await asyncio.sleep(0.1)
-
-        # Fallback: try deleting via userbot
-        logger.warning(f"Bot msg ID not found for: '{text_key[:40]}', trying userbot")
+        Userbot uses its own message counter, so IDs always match.
+        No FloodWait risk — this is a regular user action.
+        """
         try:
-            # Search recent messages from bot in chat
-            async for msg in self._client.get_chat_history(
-                self._target_chat_id, limit=5
-            ):
-                if (msg.from_user and msg.from_user.id == self._bot_user_id
-                        and msg.text and msg.text.strip()[:100] == text_key):
-                    await self._client.delete_messages(self._target_chat_id, msg.id)
-                    logger.info(f"Deleted message {msg.id} (via userbot fallback)")
-                    return
+            await self._client.delete_messages(chat_id, message_id)
+            logger.info(f"Deleted message {message_id}")
         except Exception as e:
-            logger.warning(f"Userbot delete fallback failed: {e}")
+            logger.warning(f"Delete failed for msg {message_id}: {e}")
 
     async def _worker(self) -> None:
         """Process queued messages with adaptive strategy."""
@@ -259,26 +223,42 @@ class MessageInterceptor:
                     pass
 
     async def _send_voice(self, chat_id: int, audio_path: str, caption: str = "") -> None:
-        """Send voice message via bot client, fallback to userbot."""
-        if self._bot is not None:
-            try:
-                await self._bot.send_voice(
-                    chat_id=chat_id,
-                    voice=audio_path,
-                    caption=caption[:1024] if caption else None,
-                )
-                logger.info(f"Voice sent to {chat_id} (via bot)")
-                return
-            except Exception as e:
-                logger.error(f"Bot send_voice failed: {e}")
+        """Send voice message via Bot API HTTP (appears from bot, not user)."""
+        if not self._http_session:
+            logger.error("No HTTP session for send_voice")
+            return
 
-        # Fallback to userbot
+        url = _BOT_API.format(token=self._bot_token, method="sendVoice")
+
+        try:
+            with open(audio_path, "rb") as f:
+                form = aiohttp.FormData()
+                form.add_field("chat_id", str(chat_id))
+                form.add_field("voice", f, filename="voice.ogg", content_type="audio/ogg")
+                if caption:
+                    form.add_field("caption", caption[:1024])
+
+                async with self._http_session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    data = await resp.json()
+                    if resp.status == 200 and data.get("ok"):
+                        logger.info(f"Voice sent to {chat_id} (via bot)")
+                    else:
+                        desc = data.get("description", "unknown")
+                        logger.error(f"Bot sendVoice failed: {desc}")
+                        # Fallback to userbot
+                        await self._send_voice_userbot(audio_path, caption)
+        except Exception as e:
+            logger.error(f"Bot API send_voice failed: {e}")
+            await self._send_voice_userbot(audio_path, caption)
+
+    async def _send_voice_userbot(self, audio_path: str, caption: str = "") -> None:
+        """Fallback: send voice via userbot."""
         try:
             await self._client.send_voice(
                 chat_id=self._target_chat_id,
                 voice=audio_path,
                 caption=caption[:1024] if caption else None,
             )
-            logger.info(f"Voice sent to {chat_id} (via userbot)")
+            logger.info(f"Voice sent (via userbot fallback)")
         except Exception as e:
             logger.error(f"Userbot send_voice also failed: {e}")
