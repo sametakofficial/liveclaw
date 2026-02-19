@@ -292,10 +292,10 @@ class TestTTSProxyIntegration:
     )
     def test_proxy_tts_generates_ogg(self):
         """TTS proxy should return a valid OGG file."""
-        engine = TTSEngine(
-            provider="proxy", model="tts-1", voice="Decent_Boy",
-            api_base="http://127.0.0.1:5111",
-        )
+        engine = TTSEngine.from_config({
+            "tts_provider": "proxy", "tts_model": "tts-1",
+            "tts_voice": "Decent_Boy", "tts_api_base": "http://127.0.0.1:5111",
+        })
         path = asyncio.run(engine.generate("Test cümlesi"))
         assert path is not None
         assert os.path.exists(path)
@@ -311,10 +311,10 @@ class TestTTSProxyIntegration:
         from stt_engine import STTEngine
 
         # First generate audio
-        tts = TTSEngine(
-            provider="proxy", model="tts-1", voice="Decent_Boy",
-            api_base="http://127.0.0.1:5111",
-        )
+        tts = TTSEngine.from_config({
+            "tts_provider": "proxy", "tts_model": "tts-1",
+            "tts_voice": "Decent_Boy", "tts_api_base": "http://127.0.0.1:5111",
+        })
         path = asyncio.run(tts.generate("Merhaba dünya"))
         assert path is not None
 

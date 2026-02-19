@@ -19,11 +19,11 @@ _REQUIRED = {
 
 # Optional keys with defaults
 _DEFAULTS: dict[str, Any] = {
-    "tts_provider": "proxy",
-    "tts_model": "tts-1",
-    "tts_voice": "Decent_Boy",
+    "tts_provider": "edge",          # edge | local | proxy | openai | elevenlabs
+    "tts_model": "",
+    "tts_voice": "tr-TR-AhmetNeural",  # Edge TTS default Turkish voice
     "tts_api_key": "",
-    "tts_api_base": "http://127.0.0.1:5111",
+    "tts_api_base": "",
     "stt_provider": "proxy",
     "stt_model": "whisper-large-v3-turbo",
     "stt_api_key": "",
